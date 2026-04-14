@@ -61,6 +61,12 @@ class XModemSender:
                     print(f"Error: Failed to send block {block_number}")
                     return False
                 
+                # After block 1, bootloader erases flash - wait for it to be ready
+                if block_number == 1:
+                    print("Waiting for bootloader flash erase...")
+                    time.sleep(3)
+                    self.serial.reset_input_buffer()
+                
                 progress = (block_index + 1) * 100 // total_blocks
                 print(f"Progress: {progress}% ({block_index + 1}/{total_blocks} blocks)")
                 
@@ -111,13 +117,13 @@ class XModemSender:
             crc = self._calculate_crc16(data)
             block += struct.pack('>H', crc)
             
+            # Pre-send flush for block 2: bootloader may still have garbage in buffer
+            if block_num == 2 and retry == 0:
+                self.serial.reset_input_buffer()
+            
             # Send block
             self.serial.write(block)
             self.serial.flush()
-            
-            # Special timing for bootloader
-            if block_num == 2:
-                time.sleep(0.5)
             
             # Wait for response
             response = self.serial.read(1)
@@ -185,6 +191,28 @@ def ublox_firmware_update(port, firmware_file, baudrate=115200):
         print("Connecting to module...")
         at_serial = serial.Serial(port, 115200, timeout=5)
         
+        # Wait for module to be ready (opening port toggles DTR which may reset the module)
+        print("Waiting for module ready...")
+        time.sleep(0.5)
+        at_serial.reset_input_buffer()
+        
+        module_ready = False
+        for probe in range(10):
+            at_serial.write(b"AT\r")
+            time.sleep(0.5)
+            probe_resp = at_serial.read(64)
+            print(f"Probe {probe + 1}: {probe_resp}")
+            if b"OK" in probe_resp:
+                module_ready = True
+                break
+            time.sleep(1)
+            at_serial.reset_input_buffer()
+        
+        if not module_ready:
+            print("Error: Module not responding to AT commands")
+            at_serial.close()
+            return False
+        
         print(f"Entering XMODEM mode at {baudrate} baud...")
         at_serial.write(f"AT+USYFWUS={baudrate}\r".encode())
         
@@ -193,12 +221,15 @@ def ublox_firmware_update(port, firmware_file, baudrate=115200):
             print(f"Warning: Unexpected response: {response}")
         
         time.sleep(2)
-        at_serial.close()
-        time.sleep(0.5)
         
-        # Step 2: Transfer firmware using XMODEM-1K
+        # Step 2: Change baud rate in-place (no close/reopen to avoid DTR/RTS toggle resetting the module)
         print(f"Starting XMODEM-1K transfer at {baudrate} baud...")
-        xmodem = XModemSender(port, baudrate)
+        at_serial.baudrate = baudrate
+        at_serial.reset_input_buffer()
+        
+        xmodem = XModemSender.__new__(XModemSender)
+        xmodem.serial = at_serial
+        xmodem.debug = True
         
         if xmodem.send_file(firmware_file):
             print("\nFirmware update completed successfully!")

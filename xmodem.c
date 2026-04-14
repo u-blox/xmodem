@@ -142,14 +142,14 @@ static bool send_block(HANDLE hSerial, uint8_t block_num, const uint8_t* data) {
     for (int retry = 0; retry < MAX_RETRIES; retry++) {
         printf("[XMODEM] Sending block %u, try %d\n", block_num, retry + 1);
         
+        // Pre-send delay for block 2: bootloader may still be processing after flash erase
+        if (block_num == 2 && retry == 0) {
+            serial_flush_input(hSerial);
+        }
+        
         if (!serial_write(hSerial, block, sizeof(block))) {
             printf("[XMODEM] Failed to write block %u\n", block_num);
             continue;
-        }
-        
-        // Special timing for bootloader
-        if (block_num == 2) {
-            Sleep(500);
         }
         
         // Wait for response
@@ -274,6 +274,13 @@ static bool xmodem_send_file(HANDLE hSerial, const char* filename) {
             return false;
         }
         
+        // After block 1, bootloader erases flash - wait for it to be ready
+        if (block_num == 1) {
+            printf("Waiting for bootloader flash erase...\n");
+            Sleep(3000);
+            serial_flush_input(hSerial);
+        }
+        
         // Progress indicator
         printf("Progress: %lu%% (%lu/%lu blocks)\n", 
                (block_index + 1) * 100 / total_blocks, 
@@ -319,6 +326,12 @@ static HANDLE init_serial_port(const char* port_name, DWORD baud_rate) {
         return INVALID_HANDLE_VALUE;
     }
     
+    // Set default read timeout so ReadFile doesn't block forever
+    COMMTIMEOUTS timeouts = {0};
+    timeouts.ReadIntervalTimeout = 100;
+    timeouts.ReadTotalTimeoutConstant = 2000;
+    SetCommTimeouts(hSerial, &timeouts);
+    
     return hSerial;
 }
 
@@ -330,6 +343,36 @@ static bool ublox_firmware_update(const char* port_name, const char* firmware_fi
     printf("Connecting to module...\n");
     HANDLE hSerial = init_serial_port(port_name, 115200);
     if (hSerial == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    
+    // Wait for module to be ready (opening port toggles DTR which may reset the module)
+    printf("Waiting for module ready...\n");
+    Sleep(500);
+    serial_flush_input(hSerial);
+    
+    bool module_ready = false;
+    for (int probe = 0; probe < 10; probe++) {
+        if (!serial_write(hSerial, (uint8_t*)"AT\r", 3)) {
+            continue;
+        }
+        Sleep(500);
+        uint8_t probe_buf[64];
+        DWORD probe_read = 0;
+        ReadFile(hSerial, probe_buf, sizeof(probe_buf) - 1, &probe_read, NULL);
+        probe_buf[probe_read] = '\0';
+        printf("Probe %d: %s\n", probe + 1, probe_buf);
+        if (strstr((char*)probe_buf, "OK") != NULL) {
+            module_ready = true;
+            break;
+        }
+        Sleep(1000);
+        serial_flush_input(hSerial);
+    }
+    
+    if (!module_ready) {
+        printf("Error: Module not responding to AT commands\n");
+        CloseHandle(hSerial);
         return false;
     }
     
@@ -354,15 +397,19 @@ static bool ublox_firmware_update(const char* port_name, const char* firmware_fi
     }
     
     Sleep(2000);
-    CloseHandle(hSerial);
-    Sleep(500);
     
-    // Step 2: Transfer firmware using XMODEM-1K
+    // Step 2: Change baud rate in-place (no close/reopen to avoid DTR/RTS toggle resetting the module)
     printf("Starting XMODEM-1K transfer at %lu baud...\n", baud_rate);
-    hSerial = init_serial_port(port_name, baud_rate);
-    if (hSerial == INVALID_HANDLE_VALUE) {
+    DCB dcb = {0};
+    dcb.DCBlength = sizeof(dcb);
+    GetCommState(hSerial, &dcb);
+    dcb.BaudRate = baud_rate;
+    if (!SetCommState(hSerial, &dcb)) {
+        printf("Error: Could not change baud rate to %lu\n", baud_rate);
+        CloseHandle(hSerial);
         return false;
     }
+    serial_flush_input(hSerial);
     
     bool success = xmodem_send_file(hSerial, firmware_file);
     CloseHandle(hSerial);
