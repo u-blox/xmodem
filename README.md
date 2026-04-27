@@ -194,23 +194,23 @@ support ticket.
 PC                                Module (running u-connectXpress)
  │                                 │
  │── AT\r ──────────────────────▶ │   probe AT mode
- │◀──────────────────── AT\r\nOK │
+ │◀──────────────────── AT\r\nOK  │
  │                                 │
  │── AT+USYFWUS=<baud>\r ───────▶ │   request firmware-update mode
- │◀───────────────────────── OK  │   (module switches to bootloader)
- │── (change PC baud in-place) ─  │
+ │◀───────────────────────── OK   │   (module switches to bootloader)
+ │── (change PC baud in-place) ─   │
  │                                 │
- │◀─────────────────── 'C' (0x43)│   bootloader requests CRC mode
+ │◀─────────────────── 'C' (0x43) │   bootloader requests CRC mode
  │── STX | 0x01 | 0xFE | 1024B | CRC16 ▶│  block 1 (slow: flash erase)
- │◀────────────────── ACK (0x06) │
+ │◀────────────────── ACK (0x06)  │
  │── STX | 0x02 | 0xFD | 1024B | CRC16 ▶│  block 2
- │◀────────────────── ACK (0x06) │
+ │◀────────────────── ACK (0x06)  │
  │     ... repeat ...              │
  │── EOT (0x04) ────────────────▶ │
- │◀────────────────── ACK (0x06) │   image written, module reboots
+ │◀────────────────── ACK (0x06)  │   image written, module reboots
  │                                 │
  │── AT+GMR\r ──────────────────▶ │   read back new firmware version
- │◀────────────── 3.4.0-120 / OK │
+ │◀────────────── 3.4.0-120 / OK  │
 ```
 
 Key implementation choices:
