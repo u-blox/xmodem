@@ -1,16 +1,21 @@
 /**
  * @file xmodem.c
  * @brief XMODEM Sender for u-blox Module Firmware Updates
- * 
+ *
  * Simple XMODEM-1K sender tested with real u-blox hardware.
  * Includes robust error handling and buffer management.
- * 
+ *
  * Compilation:
  *   GCC/MinGW:  gcc -o xmodem xmodem.c -lkernel32
  *   Visual Studio: cl /Fe:xmodem.exe xmodem.c kernel32.lib
- * 
+ *
  * Usage: xmodem.exe COM3 firmware.bin [115200]
  */
+
+/* Tool version. Kept in sync with the u-connectXpress user guide and the
+ * latest u-blox module firmware release that this tool has been validated
+ * against. */
+#define UCX_XMODEM_VERSION "3.4.0"
 
 #include <windows.h>
 #include <stdio.h>
@@ -32,6 +37,12 @@
 #define BLOCK_SIZE 1024
 #define MAX_RETRIES 10
 #define TIMEOUT_MS 3000
+
+// Verbose debug logging (enabled with --debug / -d). Off by default to keep
+// normal output clean; on, prints per-block byte-level activity for
+// customer/field troubleshooting.
+static bool g_debug = false;
+#define DBG(...) do { if (g_debug) { printf("[DBG] " __VA_ARGS__); } } while (0)
 
 static uint16_t calculate_crc16(const uint8_t* data, size_t length) {
     uint16_t crc = 0x0000;
@@ -97,12 +108,13 @@ static char* format_port_name(const char* port_name) {
 static bool wait_for_start_signal(HANDLE hSerial) {
     printf("Waiting for receiver ready signal...\n");
     serial_flush_input(hSerial);
-    
+
     uint8_t byte;
     DWORD start_time = GetTickCount();
-    
+
     while ((GetTickCount() - start_time) < 60000) {  // 60 second timeout
         if (serial_read_byte(hSerial, &byte, 1000)) {
+            DBG("start-signal byte 0x%02X\n", byte);
             if (byte == C_CHAR) {
                 printf("Receiver ready (CRC mode)\n");
                 return true;
@@ -140,40 +152,41 @@ static bool send_block(HANDLE hSerial, uint8_t block_num, const uint8_t* data) {
     
     // Send block with retries
     for (int retry = 0; retry < MAX_RETRIES; retry++) {
-        printf("[XMODEM] Sending block %u, try %d\n", block_num, retry + 1);
-        
-        // Pre-send delay for block 2: bootloader may still be processing after flash erase
+        if (retry > 0) {
+            printf("\n[XMODEM] Retrying block %u (try %d/%d)\n", block_num, retry + 1, MAX_RETRIES);
+        }
+        DBG("send block %u (try %d), %u bytes, crc=0x%04X\n",
+            block_num, retry + 1, (unsigned)sizeof(block), crc);
+
+        // Pre-send flush for block 2: bootloader may still have garbage in buffer
         if (block_num == 2 && retry == 0) {
             serial_flush_input(hSerial);
         }
-        
+
         if (!serial_write(hSerial, block, sizeof(block))) {
-            printf("[XMODEM] Failed to write block %u\n", block_num);
+            printf("\n[XMODEM] Failed to write block %u\n", block_num);
             continue;
         }
-        
-        // Wait for response
+
+        // Wait for response. Block 1 may take several seconds while the bootloader
+        // erases flash; subsequent blocks are normally acknowledged within ~100 ms.
+        DWORD wait_ms = (block_num == 1) ? 30000 : TIMEOUT_MS;
         uint8_t response;
-        if (serial_read_byte(hSerial, &response, TIMEOUT_MS)) {
-            printf("[XMODEM] Received response: 0x%02X\n", response);
-            
+        if (serial_read_byte(hSerial, &response, wait_ms)) {
+            DBG("block %u response 0x%02X\n", block_num, response);
             if (response == ACK) {
-                printf("[XMODEM] Block %u acknowledged\n", block_num);
-                // Clear any additional bytes that might be in the buffer
-                Sleep(50);
-                serial_flush_input(hSerial);
                 return true;
             } else if (response == NAK) {
-                printf("[XMODEM] NAK received for block %u, retrying...\n", block_num);
+                if (retry > 0) printf("[XMODEM] NAK received for block %u\n", block_num);
                 Sleep(100);
                 serial_flush_input(hSerial);
                 continue;
             } else if (response == CAN) {
-                printf("[XMODEM] Cancelled by receiver\n");
+                printf("\n[XMODEM] Cancelled by receiver\n");
                 return false;
             } else {
-                printf("[XMODEM] Unexpected response 0x%02X", response);
-                
+                printf("\n[XMODEM] Unexpected response 0x%02X for block %u", response, block_num);
+
                 // Read and display any additional bytes in buffer for debugging
                 uint8_t extra_byte;
                 int extra_count = 0;
@@ -183,19 +196,19 @@ static bool send_block(HANDLE hSerial, uint8_t block_num, const uint8_t* data) {
                     extra_count++;
                 }
                 printf("\n");
-                
+
                 Sleep(200);
                 serial_flush_input(hSerial);
                 continue;
             }
         } else {
-            printf("[XMODEM] Timeout waiting for response\n");
+            if (retry > 0) printf("[XMODEM] Timeout waiting for response on block %u\n", block_num);
             Sleep(100);
             serial_flush_input(hSerial);
         }
     }
-    
-    printf("[XMODEM] Failed after %d retries for block %u\n", MAX_RETRIES, block_num);
+
+    printf("\n[XMODEM] Failed after %d retries for block %u\n", MAX_RETRIES, block_num);
     return false;
 }
 
@@ -273,19 +286,20 @@ static bool xmodem_send_file(HANDLE hSerial, const char* filename) {
             fclose(file);
             return false;
         }
-        
-        // After block 1, bootloader erases flash - wait for it to be ready
-        if (block_num == 1) {
-            printf("Waiting for bootloader flash erase...\n");
-            Sleep(3000);
-            serial_flush_input(hSerial);
+
+        // NOTE: Do NOT sleep after block 1. The ACK for block 1 is only emitted
+        // by the bootloader once the flash erase has completed and the block has
+        // been written. Adding a delay here exceeds the bootloader's inter-block
+        // timeout and causes it to NAK, then abort and reset the module.
+
+        // In-place progress indicator. Print a newline once at completion.
+        unsigned long pct = (block_index + 1) * 100 / total_blocks;
+        printf("\rProgress: %3lu%% (%lu/%lu blocks)", pct, block_index + 1, total_blocks);
+        fflush(stdout);
+        if (block_index + 1 == total_blocks) {
+            printf("\n");
         }
-        
-        // Progress indicator
-        printf("Progress: %lu%% (%lu/%lu blocks)\n", 
-               (block_index + 1) * 100 / total_blocks, 
-               block_index + 1, total_blocks);
-        
+
         // Increment block number with natural 8-bit wraparound
         block_num = (block_num + 1) % 256;
     }
@@ -336,7 +350,7 @@ static HANDLE init_serial_port(const char* port_name, DWORD baud_rate) {
 }
 
 static bool ublox_firmware_update(const char* port_name, const char* firmware_file, DWORD baud_rate) {
-    printf("u-blox Module Firmware Update Tool\n");
+    printf("u-blox Module Firmware Update Tool v%s\n", UCX_XMODEM_VERSION);
     printf("========================================\n");
     
     // Step 1: Send AT command to enter XMODEM mode
@@ -456,20 +470,47 @@ static bool ublox_firmware_update(const char* port_name, const char* firmware_fi
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        printf("XMODEM Sender for u-blox Module Firmware Updates\n");
-        printf("Usage: %s <port> <firmware_file> [baud_rate]\n", argv[0]);
+    // Parse leading flags: --version / -v, --debug / -d
+    int argi = 1;
+    while (argi < argc && argv[argi][0] == '-') {
+        if (strcmp(argv[argi], "--version") == 0 || strcmp(argv[argi], "-v") == 0) {
+            printf("ucx-xmodem %s\n", UCX_XMODEM_VERSION);
+            return 0;
+        } else if (strcmp(argv[argi], "--debug") == 0 || strcmp(argv[argi], "-d") == 0) {
+            g_debug = true;
+            argi++;
+        } else {
+            printf("Unknown option: %s\n", argv[argi]);
+            return 1;
+        }
+    }
+
+    if ((argc - argi) < 2) {
+        const char* prog = strrchr(argv[0], '\\');
+        prog = prog ? prog + 1 : argv[0];
+        printf("XMODEM Sender for u-blox Module Firmware Updates (v%s)\n", UCX_XMODEM_VERSION);
+        printf("Usage: %s [--debug|-d] <port> <firmware_file> [baud_rate]\n", prog);
+        printf("       %s --version\n", prog);
+        printf("\n");
+        printf("Options:\n");
+        printf("  --debug, -d    Verbose protocol logging for troubleshooting\n");
+        printf("  --version, -v  Print tool version and exit\n");
         printf("\n");
         printf("Examples:\n");
-        printf("  %s COM3 firmware.bin\n", argv[0]);
-        printf("  %s COM3 firmware.bin 115200\n", argv[0]);
+        printf("  %s COM3 firmware.bin\n", prog);
+        printf("  %s COM3 firmware.bin 115200\n", prog);
+        printf("  %s --debug COM22 firmware.bin\n", prog);
         return 1;
     }
-    
-    const char* port_name = argv[1];
-    const char* firmware_file = argv[2];
-    DWORD baud_rate = (argc > 3) ? atol(argv[3]) : 115200;
-    
+
+    const char* port_name = argv[argi];
+    const char* firmware_file = argv[argi + 1];
+    DWORD baud_rate = ((argc - argi) > 2) ? atol(argv[argi + 2]) : 115200;
+
+    if (g_debug) {
+        printf("[DBG] debug logging enabled\n");
+    }
+
     bool success = ublox_firmware_update(port_name, firmware_file, baud_rate);
     return success ? 0 : 1;
 }
